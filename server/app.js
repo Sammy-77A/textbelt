@@ -1,10 +1,45 @@
 const express = require('express');
+const redis = require('redis');
 
 const carriers = require('../lib/carriers.js');
 const providers = require('../lib/providers.js');
 const text = require('../lib/text');
 
 const app = express();
+
+// Connect to Render's Redis instance
+const redisClient = redis.createClient({
+  url: process.env.REDIS_URL
+});
+
+redisClient.on('error', (err) => console.log('Redis Client Error', err));
+redisClient.connect()
+  .then(() => console.log('Connected to Redis successfully'))
+  .catch((err) => console.error('Failed to connect to Redis:', err));
+
+// Rate Limiting Middleware
+const rateLimiter = async (req, res, next) => {
+  const userIP = req.ip;
+  
+  try {
+    const requests = await redisClient.incr(userIP);
+    
+    // Set the expiry to 1 hour (3600 seconds) on the first request
+    if (requests === 1) {
+      await redisClient.expire(userIP, 3600);
+    }
+    
+    // Limit to 5 OTP requests per hour per IP
+    if (requests > 5) {
+      return res.status(429).send({ success: false, message: 'Too many OTP requests. Please try again later.' });
+    }
+    
+    next();
+  } catch (err) {
+    console.error('Redis error during rate limiting:', err);
+    next(); // If Redis fails, allow the request so the app doesn't break
+  }
+};
 
 // Express config
 app.use(express.json());
@@ -39,7 +74,7 @@ function textRequestHandler(req, res, number, carrier, region) {
       res.send({
         success: false,
         message: `Carrier ${carrier} not supported! POST getcarriers=1 to `
-                                                               + 'get a list of supported carriers',
+                                                         + 'get a list of supported carriers',
       });
       return;
     }
@@ -75,7 +110,8 @@ app.get('/providers/:region', (req, res) => {
   res.send(providers[req.params.region]);
 });
 
-app.post('/text', (req, res) => {
+// Added rateLimiter middleware to the POST routes
+app.post('/text', rateLimiter, (req, res) => {
   if (req.body.getcarriers != null
       && (req.body.getcarriers === '1'
        || req.body.getcarriers.toLowerCase() === 'true')) {
@@ -90,11 +126,11 @@ app.post('/text', (req, res) => {
   textRequestHandler(req, res, number, req.body.carrier, 'us');
 });
 
-app.post('/canada', (req, res) => {
+app.post('/canada', rateLimiter, (req, res) => {
   textRequestHandler(req, res, stripPhone(req.body.number), req.body.carrier, 'canada');
 });
 
-app.post('/intl', (req, res) => {
+app.post('/intl', rateLimiter, (req, res) => {
   textRequestHandler(req, res, stripPhone(req.body.number), req.body.carrier, 'intl');
 });
 
